@@ -4,8 +4,8 @@ from states import *
 import os
 
 n = 5 # number of qubits
-q = 2 # number of qubits compressed n -> q (q=0 means fully coherent algo, q=n means fully local algo)
-plot_mode = "NU1_vary_NM" # plot_mode can be either "NU1_vary_NM" (varying N_M with fixed N_U=1) or "NM100_vary_NU" (varying N_U with fixed N_M=100)
+q = 0 # number of kept qubits (0 is fully local, n is fully coherent)
+plot_mode = "NM100_vary_NU" # plot_mode can be either "NU1_vary_NM" (varying N_M with fixed N_U=1) or "NM100_vary_NU" (varying N_U with fixed N_M=100)
 
 raw_dir = "raw_data" # directory where the raw data is stored
 result_dir = "bootstrap_data" # directory where the bootstrap results will be saved
@@ -13,7 +13,8 @@ p = 0.3 # noise parameter for the noisy GHZ state
 depth = 5 # brickwork circuit depth. Positive integers or np.inf (denoting perfect haar randomness)
 K_list = [2, 3, 4, 5] # the state powers to be estimated. For example, K_list = [2, 3, 4, 5] means the goal is to estimate tr(rho^2), tr(rho^3), tr(rho^4), tr(rho^5)..
 method = "coincide" # method can be either "coincide" or "branch". "coincide" matches the method throughout the manuscript. "branch" is the method with fixed projector (measurement outcomes)
-B = 10 # number of bootstrap trials
+figure_q0_right = (n, p, depth, q, plot_mode) == (5, 0.3, 5, 0, "NM100_vary_NU")
+B = 500 if figure_q0_right else 10
 
 os.makedirs(result_dir, exist_ok=True)
 
@@ -33,7 +34,10 @@ if plot_mode == "NU1_vary_NM":
     N_boot_list = np.unique(np.logspace(2, 5, 30).astype(int)) # set the suitable range of N_boot_list to vary NU or NM. For example, np.logspace(2, 5, 30) means N_boot varies from 10^2 to 10^5 with 30 points in log scale.
     raw_path = os.path.join(raw_dir, f"noisy_ghz_n{n}_{param_tag}_depth{depth}_q{q}_NU1_NM10000000_data.npz") # 
 else:
-    N_U_boot_list = np.unique(np.logspace(0, 5, 30).astype(int)) # similar here
+    if figure_q0_right:
+        N_U_boot_list = np.logspace(0, 4, 30).astype(int)
+    else:
+        N_U_boot_list = np.unique(np.logspace(0, 5, 30).astype(int))
     N_boot_list = 100 * N_U_boot_list
     raw_path = os.path.join(raw_dir, f"noisy_ghz_n{n}_{param_tag}_depth{depth}_q{q}_NU100000_NM100_data.npz")
 
@@ -58,7 +62,48 @@ x_values = []
 mean_errors_by_K = {K: [] for K in K_list}
 std_errors_by_K = {K: [] for K in K_list}
 
-for N_boot in N_boot_list:
+if figure_q0_right:
+    # The raw writer stores contiguous blocks, one per unitary, in shot order.
+    shots = int(data["N_M"])
+    if shots != 100:
+        raise ValueError("The right panel requires 100 shots per unitary.")
+    block_count = int(data["num_saved"]) // shots
+    if block_count == 0:
+        raise ValueError("The input contains no complete 100-shot blocks.")
+    N_U_boot_list = N_U_boot_list[N_U_boot_list <= block_count]
+    N_boot_list = shots * N_U_boot_list
+    stop = block_count * shots
+    outcomes = data["outcomes"][:stop].reshape(block_count, shots)
+    unitary_ids = data["U_index"][:stop].reshape(block_count, shots)
+    if not np.all(unitary_ids == np.arange(block_count)[:, None]):
+        raise ValueError("Expected contiguous unitary blocks in raw measurement order.")
+    shot_ids = data["M_index"][:stop].reshape(block_count, shots)
+    if not np.all(shot_ids == np.arange(shots)):
+        raise ValueError("Expected one record per shot in each unitary block.")
+
+    # Compute the existing collision estimator once per unitary using all its shots.
+    d = int(data["d"])
+    orders = list(range(2, max(K_list) + 1))
+    h_by_unitary = np.empty((block_count, len(orders)))
+    for i, block in enumerate(outcomes):
+        h = estimate_h_from_full_register_outcomes(block, d, orders)
+        h_by_unitary[i] = [h[k] for k in orders]
+
+    # One ordered subsample per trial. Smaller budgets use prefixes of that draw.
+    rng = np.random.default_rng([20261123, 0])
+    errors = np.empty((B, len(N_U_boot_list), len(K_list)))
+    for trial in range(B):
+        selected = rng.choice(block_count, size=N_U_boot_list.max(), replace=False)
+        sums = np.cumsum(h_by_unitary[selected], axis=0)
+        means = sums[N_U_boot_list - 1] / N_U_boot_list[:, None]
+        for i, mean in enumerate(means):
+            moments = recover_moments_from_h_dict(dict(zip(orders, mean)), K_list)
+            errors[trial, i] = [abs(moments[k] - true_values[k]) for k in K_list]
+
+    mean_errors = errors.mean(axis=0)
+    std_errors = errors.std(axis=0, ddof=1)
+
+for i, N_boot in enumerate(N_boot_list):
     if plot_mode == "NU1_vary_NM":
         N_U_boot, N_M_boot, x_value = 1, int(N_boot), int(N_boot)
     else:
@@ -69,7 +114,10 @@ for N_boot in N_boot_list:
         x_value = N_U_boot * N_M_boot
 
     try:
-        if fully_local:
+        if figure_q0_right:
+            result = {f"mean_error_K{k}": mean_errors[i, j] for j, k in enumerate(K_list)}
+            result.update({f"std_error_K{k}": std_errors[i, j] for j, k in enumerate(K_list)})
+        elif fully_local:
             result = bootstrap_full_register_moment_errors(data=data, K_list=K_list, true_values=true_values, N_U_boot=N_U_boot, N_M_boot=N_M_boot, B=B)
         else:
             result = bootstrap_recovered_moment_errors(data=data, method=method, K_list=K_list, true_values=true_values, N_U_boot=N_U_boot, N_M_boot=N_M_boot, B=B, fully_coherent=fully_coherent)
